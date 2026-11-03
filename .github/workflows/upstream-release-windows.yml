@@ -1,0 +1,348 @@
+name: Sync Upstream Release and Build Windows
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional upstream release tag, for example v0.6.2
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-release-windows
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: looplj/reveric
+  FLUTTER_VERSION: 0b771a584214b44aa1f94f9707f2756207356f41
+  FLUTTER_CHANNEL: master
+  FASTFORGE_VERSION: 0.6.6
+  ONNX_RUNTIME_SHA256: 3958d8a44984160692c1b4ffd0de3cb48f8c39f9d34bb31e433db06e30b82195
+  VC_REDIST_SHA256: 843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c
+  INNO_ZH_SHA256: e0b0b350e2245f3c5e65586dfe43d574f6e7f06f2261149aba284954b3fc9a8d
+
+jobs:
+  discover:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.release.outputs.should_build }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Resolve upstream release
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+            endpoint="https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/tags/${tag}"
+          else
+            endpoint="https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest"
+          fi
+          release_json="$(curl --fail --silent --show-error --location \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" "$endpoint")"
+          tag="$(jq -r '.tag_name' <<<"$release_json")"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream release tag: $tag" >&2
+            exit 1
+          fi
+          status="$(curl --silent --show-error --location \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -o /dev/null -w '%{http_code}' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          case "$status" in
+            200)
+              echo "Fork release $tag already exists; nothing to build."
+              {
+                echo 'should_build=false'
+                echo "tag=$tag"
+                echo "version=${tag#v}+${GITHUB_RUN_NUMBER}"
+              } >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              {
+                echo 'should_build=true'
+                echo "tag=$tag"
+                echo "version=${tag#v}+${GITHUB_RUN_NUMBER}"
+              } >> "$GITHUB_OUTPUT"
+              echo "New upstream release detected: $tag"
+              ;;
+            *)
+              echo "Unexpected fork release lookup status: $status" >&2
+              exit 1
+              ;;
+          esac
+
+  sync:
+    name: Sync upstream source
+    needs: discover
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.sync.outputs.source_sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+      version: ${{ steps.sync.outputs.version }}
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: unstable
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Sync upstream release source
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.discover.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.discover.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          source_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          echo "Upstream ${RELEASE_TAG} resolves to ${source_sha}"
+
+          if git ls-remote --exit-code origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            remote_tag_sha="$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk '{print $1}')"
+            if [[ -z "$remote_tag_sha" ]]; then
+              remote_tag_sha="$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk '{print $1}')"
+            fi
+            if [[ "$remote_tag_sha" != "$source_sha" ]]; then
+              echo "Fork tag ${RELEASE_TAG} points to ${remote_tag_sha}, expected ${source_sha}" >&2
+              exit 1
+            fi
+          else
+            git push origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          fi
+
+          automation="$(mktemp)"
+          cp .github/workflows/upstream-release-windows.yml "$automation"
+          test "$(git rev-parse --show-toplevel)" = "$GITHUB_WORKSPACE"
+          git checkout --detach "$source_sha"
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp "$automation" .github/workflows/upstream-release-windows.yml
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: sync upstream release ${RELEASE_TAG}"
+          fi
+          git push origin HEAD:refs/heads/unstable --force-with-lease
+          synced_sha="$(git rev-parse HEAD)"
+          {
+            echo "source_sha=$synced_sha"
+            echo "tag=$RELEASE_TAG"
+            echo "version=$RELEASE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and scan Windows installer
+    needs: [discover, sync]
+    if: ${{ needs.discover.outputs.should_build == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Enable Git long paths
+        shell: pwsh
+        run: git config --system core.longpaths true
+
+      - name: Checkout synced source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.sync.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned Flutter SDK
+        uses: subosito/flutter-action@395322a6cded4e9ed503aebd4cc1965625f8e59a
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Install Fastforge
+        shell: pwsh
+        run: |
+          dart pub global activate fastforge $env:FASTFORGE_VERSION
+          $pubCache = if ($env:PUB_CACHE) { $env:PUB_CACHE } else { Join-Path $env:LOCALAPPDATA 'Pub\Cache' }
+          $pubBin = Join-Path $pubCache 'bin'
+          if (-not (Test-Path (Join-Path $pubBin 'fastforge.bat'))) { throw "Fastforge executable was not installed in $pubBin" }
+          $pubBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $pubBin 'fastforge.bat') --version
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes --limit-output
+
+      - name: Install pinned Inno Setup Chinese language file
+        shell: pwsh
+        run: |
+          $uri = 'https://raw.githubusercontent.com/jrsoftware/issrc/5bcadfcd05e9857a47a6880a2ac0694c9ab60122/Files/Languages/ChineseSimplified.isl'
+          $destination = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
+          Invoke-WebRequest -Uri $uri -OutFile $destination
+          $actual = (Get-FileHash $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:INNO_ZH_SHA256) { throw "ChineseSimplified.isl checksum mismatch: $actual" }
+
+      - name: Download and verify VC++ runtime
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:GITHUB_WORKSPACE 'windows\packaging\exe\vc_redist.x64.exe'
+          Invoke-WebRequest -Uri 'https://aka.ms/vc14/vc_redist.x64.exe' -OutFile $destination
+          $actual = (Get-FileHash $destination -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:VC_REDIST_SHA256) { throw "VC++ runtime checksum mismatch: $actual" }
+
+      - name: Set build version
+        shell: pwsh
+        env:
+          BUILD_VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          $path = Join-Path $env:GITHUB_WORKSPACE 'pubspec.yaml'
+          $content = Get-Content $path -Raw
+          $content = [regex]::Replace($content, '(?m)^version:.*$', "version: $env:BUILD_VERSION")
+          Set-Content -Path $path -Value $content -Encoding utf8
+
+      - name: Disable sqlite3 system hook
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:GITHUB_WORKSPACE 'pubspec.yaml'
+          $lines = Get-Content $path
+          $output = [System.Collections.Generic.List[string]]::new()
+          $inHooks = $false
+          foreach ($line in $lines) {
+            if ($line.StartsWith('hooks:')) {
+              $inHooks = $true
+              $output.Add("# $line")
+            } elseif ($inHooks -and $line.StartsWith(' ')) {
+              $output.Add("# $line")
+            } else {
+              $inHooks = $false
+              $output.Add($line)
+            }
+          }
+          Set-Content -Path $path -Value $output -Encoding utf8
+          Remove-Item -Recurse -Force '.dart_tool/hooks_runner/sqlite3' -ErrorAction SilentlyContinue
+
+      - name: Resolve Dart dependencies
+        shell: pwsh
+        run: flutter pub get
+
+      - name: Run Windows installer runtime tests
+        shell: pwsh
+        run: |
+          $fpc = Get-Command fpc -ErrorAction SilentlyContinue
+          if ($null -ne $fpc) {
+            python -m unittest discover -s scripts/tests -p test_windows_runtime.py -v
+          } else {
+            Write-Host 'Free Pascal is not installed on the hosted runner; skipping the Inno Setup Pascal simulation.'
+          }
+
+      - name: Prepare depth runtime
+        shell: pwsh
+        run: ./third/depth-native/prepare-product-windows.ps1
+
+      - name: Build installer
+        shell: pwsh
+        run: fastforge release --name release --jobs windows-exe --skip-clean
+
+      - name: Verify installer output
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -Path dist -Filter '*-setup.exe' -Recurse -File)
+          if ($installers.Count -ne 1) { throw "Expected exactly one installer, found $($installers.Count)" }
+          $installer = $installers[0]
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$($installer.Name)  $hash" | Out-File -FilePath (Join-Path $env:GITHUB_WORKSPACE 'dist\SHA256SUMS.txt') -Encoding ascii
+          Write-Host "Installer: $($installer.FullName)"
+          Write-Host "SHA256: $hash"
+
+      - name: Scan installer with Microsoft Defender
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem -Path dist -Filter '*-setup.exe' -Recurse -File)
+          if ($installer.Count -ne 1) { throw "Expected exactly one installer for scanning, found $($installer.Count)" }
+          $mpCmd = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName |
+            Select-Object -Last 1
+          if ($null -eq $mpCmd) { throw 'Microsoft Defender command-line scanner was not found' }
+          & $mpCmd.FullName -Scan -ScanType 3 -File $installer[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender scan failed with exit code $LASTEXITCODE" }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: reveric-windows-installer-${{ needs.sync.outputs.tag }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            dist/**/*-setup.exe
+            dist/SHA256SUMS.txt
+
+  publish:
+    name: Publish fork release
+    needs: [discover, sync, build]
+    if: ${{ needs.discover.outputs.should_build == 'true' }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: reveric-windows-installer-${{ needs.sync.outputs.tag }}
+          path: artifact
+
+      - name: Publish release and installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+          RELEASE_SHA: ${{ needs.sync.outputs.source_sha }}
+          UPSTREAM_REPOSITORY: ${{ env.UPSTREAM_REPOSITORY }}
+          SYNC_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          installer="$(find artifact -type f -name '*-setup.exe' -print -quit)"
+          sums="$(find artifact -type f -name SHA256SUMS.txt -print -quit)"
+          if [[ -z "$installer" || -z "$sums" ]]; then
+            echo 'Installer artifact is incomplete' >&2
+            exit 1
+          fi
+          upstream_body="$(curl --fail --silent --show-error --location \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/tags/${RELEASE_TAG}" |
+            jq -r '.body // ""')"
+          notes="Built from upstream ${UPSTREAM_REPOSITORY} release ${RELEASE_TAG}.\n\nSource commit: ${RELEASE_SHA}\nSynced tag: ${SYNC_TAG}\n\nUpstream release notes:\n${upstream_body}"
+          printf '%b\n' "$notes" > release-notes.md
+          gh release create "$RELEASE_TAG" "$installer" "$sums" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "${RELEASE_TAG} (source build)" \
+            --notes-file release-notes.md
